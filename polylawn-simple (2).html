@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polylawn — Rain Suitability</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         max-width: 480px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { font-size: 18px; margin-bottom: 18px; }
+  .row { display: flex; gap: 8px; }
+  input { flex: 1; padding: 10px 12px; font-size: 15px; border: 1px solid #ccc;
+          border-radius: 6px; font-family: inherit; }
+  button { padding: 10px 18px; font-size: 15px; border: none; border-radius: 6px;
+           background: #2d7a4f; color: #fff; cursor: pointer; font-family: inherit; }
+  button:disabled { background: #9bc2ab; }
+  #status { font-size: 13px; color: #767676; margin-top: 10px; min-height: 16px; }
+  #out { margin-top: 24px; display: none; }
+  .loc { font-size: 13px; color: #767676; margin-bottom: 14px; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+  .card.rank1 { border-color: #2d7a4f; background: #eef7f1; }
+  .name { font-weight: 700; font-size: 15px; }
+  .type { font-size: 12px; color: #767676; margin-bottom: 6px; }
+  .score { font-size: 22px; font-weight: 700; color: #2d7a4f; float: right; }
+  .why { font-size: 12px; color: #555; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>Which grass fits your rainfall?</h1>
+<div class="row">
+  <input id="address" placeholder="Enter an address">
+  <button id="btn" onclick="run()">Check</button>
+</div>
+<div id="status"></div>
+
+<div id="out">
+  <div class="loc" id="loc"></div>
+  <div id="cards"></div>
+</div>
+
+<script>
+// Three grasses spanning the drought-tolerance spectrum, each with an
+// "ideal" summer (Jun–Aug) rainfall range in inches, and an ideal soil pH
+// range. Suitability is scored by how close the site's actual value falls
+// to each range — a simplified version of the same optimum-range
+// suitability-mapping approach used in turfgrass/ecological siting studies:
+// full score inside the ideal range, stepped penalties the further outside it you go.
+// Overall SI is the average of the rain score and the pH score.
+var PLANTS = [
+  { name: 'Buffalograss',      type: 'Drought tolerant',  rainLo: 0,  rainHi: 5,  phLo: 6.0, phHi: 8.5 },
+  { name: 'Tall Fescue',       type: 'Drought OK',        rainLo: 5,  rainHi: 10, phLo: 5.5, phHi: 7.5 },
+  { name: 'Kentucky Bluegrass',type: 'Needs regular rain',rainLo: 10, rainHi: 18, phLo: 6.0, phHi: 7.5 },
+];
+
+function rangeScore(value, lo, hi, step) {
+  var gap = value < lo ? lo - value : value > hi ? value - hi : 0;
+  return gap === 0 ? 100 : gap <= step ? 78 : gap <= step * 2 ? 55 : gap <= step * 3.5 ? 32 : 12;
+}
+function siScore(precip, ph, p) {
+  var rainScore = rangeScore(precip, p.rainLo, p.rainHi, 2);
+  var phScore = ph != null ? rangeScore(ph, p.phLo, p.phHi, 0.4) : 60; // neutral default if pH unavailable
+  return { total: Math.round((rainScore + phScore) / 2), rainScore: rainScore, phScore: phScore };
+}
+
+async function geocode(addr) {
+  var r = await fetch('https://photon.komoot.io/api/?q=' + encodeURIComponent(addr) + '&limit=1&lang=en');
+  var d = await r.json();
+  if (!d.features || !d.features.length) return null;
+  var f = d.features[0], p = f.properties;
+  return {
+    lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0],
+    name: [p.name, p.city || p.county, p.state, p.country].filter(Boolean).join(', ')
+  };
+}
+
+async function fetchClimate(lat, lon) {
+  var url = 'https://archive-api.open-meteo.com/v1/archive'
+    + '?latitude=' + lat.toFixed(4) + '&longitude=' + lon.toFixed(4)
+    + '&start_date=2019-01-01&end_date=2023-12-31'
+    + '&daily=precipitation_sum&timezone=auto';
+  var r = await fetch(url);
+  var j = await r.json();
+  if (!j.daily || !j.daily.time) return null;
+
+  // Sum precipitation for June, July, August each year, then average across years
+  var byYear = {};
+  j.daily.time.forEach(function (t, i) {
+    var y = t.slice(0, 4), m = parseInt(t.slice(5, 7));
+    if (m >= 6 && m <= 8) {
+      byYear[y] = (byYear[y] || 0) + (j.daily.precipitation_sum[i] || 0);
+    }
+  });
+  var years = Object.keys(byYear);
+  var avgMm = years.reduce(function (s, y) { return s + byYear[y]; }, 0) / years.length;
+  return avgMm / 25.4; // mm -> inches, average summer (Jun-Aug) rainfall
+}
+
+// SoilGrids v2.0 masks out water, glaciers, AND built-up/urban land — so a
+// geocoded street address (which is, by definition, in a built-up area)
+// almost always lands on a masked pixel. The nearest real data is usually
+// just a few hundred metres away (a yard, park, or field), but dense urban
+// cores can need a few kilometres.
+//
+// Speed fix: the old version checked expanding rings ONE AT A TIME,
+// waiting for each round trip before starting the next — up to 8
+// sequential round trips in the worst case. This version fires every
+// candidate point across all rings in a SINGLE parallel batch, with a
+// short per-request timeout, so total wait is roughly one round trip
+// (a few seconds) instead of one round trip PER ring.
+async function phAt(lat, lon, timeoutMs) {
+  var ctrl = new AbortController();
+  var t = setTimeout(function () { ctrl.abort(); }, timeoutMs);
+  try {
+    var url = 'https://rest.isric.org/soilgrids/v2.0/properties/query'
+      + '?lon=' + lon.toFixed(5) + '&lat=' + lat.toFixed(5) + '&property=phh2o&depth=0-5cm&value=mean';
+    var r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    var j = await r.json();
+    var layer = j && j.properties && j.properties.layers && j.properties.layers[0];
+    var v = layer && layer.depths && layer.depths[0] && layer.depths[0].values && layer.depths[0].values.mean;
+    return v != null ? v / 10 : null; // SoilGrids pH is x10
+  } catch (e) { clearTimeout(t); return null; }
+}
+
+function ringPoints(lat, lon, radiusM) {
+  var mLa = 111000, mLo = 111000 * Math.cos(lat * Math.PI / 180);
+  var pts = [];
+  for (var i = 0; i < 8; i++) {
+    var ang = (i / 8) * 2 * Math.PI;
+    pts.push({
+      lat: lat + Math.cos(ang) * radiusM / mLa,
+      lon: lon + Math.sin(ang) * radiusM / mLo,
+      dist: radiusM
+    });
+  }
+  return pts;
+}
+
+async function fetchSoilPh(lat, lon) {
+  // Build every candidate point up front: the exact address, then 8-point
+  // rings at increasing radii out to ~5 km. All fired together below.
+  var candidates = [{ lat: lat, lon: lon, dist: 0 }]
+    .concat(ringPoints(lat, lon, 400))
+    .concat(ringPoints(lat, lon, 1200))
+    .concat(ringPoints(lat, lon, 3000))
+    .concat(ringPoints(lat, lon, 5000));
+
+  var timeoutMs = 6000; // hard cap per request so the whole batch resolves in one round trip
+  var vals = await Promise.all(candidates.map(function (c) { return phAt(c.lat, c.lon, timeoutMs); }));
+
+  var best = null, bestDist = Infinity;
+  for (var i = 0; i < vals.length; i++) {
+    if (vals[i] != null && candidates[i].dist < bestDist) { best = vals[i]; bestDist = candidates[i].dist; }
+  }
+  return best != null ? { ph: best, offsetM: bestDist } : null;
+}
+
+async function run() {
+  var addr = document.getElementById('address').value.trim();
+  var btn = document.getElementById('btn');
+  var status = document.getElementById('status');
+  var out = document.getElementById('out');
+  out.style.display = 'none';
+  status.textContent = '';
+  if (!addr) { status.textContent = 'Enter an address.'; return; }
+
+  btn.disabled = true; btn.textContent = 'Checking…';
+  status.textContent = 'Geocoding address…';
+
+  try {
+    var geo = await geocode(addr);
+    if (!geo) throw new Error('Address not found.');
+
+    status.textContent = 'Fetching climate and soil data…';
+    var results = await Promise.all([
+      fetchClimate(geo.lat, geo.lon),
+      fetchSoilPh(geo.lat, geo.lon)
+    ]);
+    var summerPrecipIn = results[0];
+    var soilHit = results[1];
+    var ph = soilHit ? soilHit.ph : null;
+    if (summerPrecipIn == null) throw new Error('Climate data unavailable.');
+
+    var ranked = PLANTS.map(function (p) {
+      var s = siScore(summerPrecipIn, ph, p);
+      return { plant: p, si: s.total, rainScore: s.rainScore, phScore: s.phScore };
+    }).sort(function (a, b) { return b.si - a.si; });
+
+    document.getElementById('loc').textContent =
+      geo.name + ' — summer rainfall: ' + summerPrecipIn.toFixed(1) + '"'
+      + (ph != null ? ' · soil pH: ' + ph.toFixed(1) + (soilHit.offsetM > 0 ? ' (nearest data ~' + soilHit.offsetM + 'm away)' : '') : ' · soil pH: no data found nearby');
+
+    document.getElementById('cards').innerHTML = ranked.map(function (r, i) {
+      return '<div class="card' + (i === 0 ? ' rank1' : '') + '">'
+        + '<span class="score">' + r.si + '</span>'
+        + '<div class="name">#' + (i + 1) + ' ' + r.plant.name + '</div>'
+        + '<div class="type">' + r.plant.type + '</div>'
+        + '<div class="why">Ideal rain ' + r.plant.rainLo + '–' + r.plant.rainHi + '" (score ' + r.rainScore + ') · ideal pH ' + r.plant.phLo + '–' + r.plant.phHi + ' (score ' + r.phScore + ')</div>'
+        + '</div>';
+    }).join('');
+
+    out.style.display = 'block';
+    status.textContent = '';
+  } catch (e) {
+    status.textContent = e.message;
+  }
+  btn.disabled = false; btn.textContent = 'Check';
+}
+
+document.getElementById('address').addEventListener('keydown', function (e) { if (e.key === 'Enter') run(); });
+</script>
+</body>
+</html>
